@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/flashbots/mev-boost/server/types/pocTypes"
 	"io"
 	"net/http"
 	"net/url"
@@ -39,6 +40,7 @@ var (
 	errInvalidPubkey             = errors.New("invalid pubkey")
 	errNoSuccessfulRelayResponse = errors.New("no successful relay response")
 	errServerAlreadyRunning      = errors.New("server already running")
+	errInvalidInclusionList      = errors.New("invalid inclusionList")
 )
 
 var (
@@ -67,10 +69,11 @@ type BoostServiceOpts struct {
 	RelayCheck            bool
 	RelayMinBid           types.U256Str
 
-	RequestTimeoutGetHeader  time.Duration
-	RequestTimeoutGetPayload time.Duration
-	RequestTimeoutRegVal     time.Duration
-	RequestMaxRetries        int
+	RequestTimeoutGetHeader         time.Duration
+	RequestTimeoutGetPayload        time.Duration
+	RequestTimeoutRegVal            time.Duration
+	RequestTimeoutSendInclusionList time.Duration
+	RequestMaxRetries               int
 }
 
 // BoostService - the mev-boost service
@@ -84,11 +87,13 @@ type BoostService struct {
 	relayMinBid   types.U256Str
 	genesisTime   uint64
 
-	builderSigningDomain phase0.Domain
-	httpClientGetHeader  http.Client
-	httpClientGetPayload http.Client
-	httpClientRegVal     http.Client
-	requestMaxRetries    int
+	builderSigningDomain        phase0.Domain
+	httpClientGetHeader         http.Client
+	httpClientGetPayload        http.Client
+	httpClientRegVal            http.Client
+	httpClientSendInclusionList http.Client
+
+	requestMaxRetries int
 
 	bids     map[bidRespKey]bidResp // keeping track of bids, to log the originating relay on withholding
 	bidsLock sync.Mutex
@@ -132,6 +137,10 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 			Timeout:       opts.RequestTimeoutRegVal,
 			CheckRedirect: httpClientDisallowRedirects,
 		},
+		httpClientSendInclusionList: http.Client{
+			Timeout:       opts.RequestTimeoutSendInclusionList,
+			CheckRedirect: httpClientDisallowRedirects,
+		},
 		requestMaxRetries: opts.RequestMaxRetries,
 	}, nil
 }
@@ -163,6 +172,7 @@ func (m *BoostService) getRouter() http.Handler {
 	r.HandleFunc(params.PathRegisterValidator, m.handleRegisterValidator).Methods(http.MethodPost)
 	r.HandleFunc(params.PathGetHeader, m.handleGetHeader).Methods(http.MethodGet)
 	r.HandleFunc(params.PathGetPayload, m.handleGetPayload).Methods(http.MethodPost)
+	r.HandleFunc(params.PathSendInclusionList, m.handleSendInclusionList).Methods(http.MethodPost)
 
 	r.Use(mux.CORSMethodMiddleware(r))
 	loggedRouter := httplogger.LoggingMiddlewareLogrus(m.log, r)
@@ -833,4 +843,106 @@ func (m *BoostService) CheckRelays() int {
 	// At the end, wait for every routine and return status according to relay's ones.
 	wg.Wait()
 	return int(numSuccessRequestsToRelay)
+}
+
+func (m *BoostService) handleSendInclusionList(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	slot := vars["slot"]
+	parentHashHex := vars["parent_hash"]
+	pubkey := vars["pubkey"]
+
+	ua := UserAgent(req.Header.Get("User-Agent"))
+	log := m.log.WithFields(logrus.Fields{
+		"method":     "sendInclusionList",
+		"slot":       slot,
+		"parentHash": parentHashHex,
+		"pubkey":     pubkey,
+		"ua":         ua,
+	})
+	log.Debug("sendInclusionList request starts")
+
+	// Read the body first, so we can log it later on error
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		log.WithError(err).Error("could not read body of request from the beacon node")
+		m.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Decode the body now
+	inclusionList := new(pocTypes.InclusionList)
+	if err := DecodeJSON(bytes.NewReader(body), inclusionList); err != nil {
+		log.WithError(err).WithField("body", string(body)).Error("could not decode request payload from the beacon-node")
+		m.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if len(inclusionList.Transactions) == 0 {
+		m.respondError(w, http.StatusBadRequest, errInvalidInclusionList.Error())
+		return
+	}
+	_slot, err := strconv.ParseUint(slot, 10, 64)
+	if err != nil {
+		m.respondError(w, http.StatusBadRequest, errInvalidSlot.Error())
+		return
+	}
+
+	if len(pubkey) != 98 {
+		m.respondError(w, http.StatusBadRequest, errInvalidPubkey.Error())
+		return
+	}
+
+	if len(parentHashHex) != 66 {
+		m.respondError(w, http.StatusBadRequest, errInvalidHash.Error())
+		return
+	}
+
+	// Make sure we have a uid for this slot
+	m.slotUIDLock.Lock()
+	if m.slotUID.slot < _slot {
+		m.slotUID.slot = _slot
+		m.slotUID.uid = uuid.New()
+	}
+	slotUID := m.slotUID.uid
+	m.slotUIDLock.Unlock()
+	log = log.WithField("slotUID", slotUID)
+
+	// Log how late into the slot the request starts
+	slotStartTimestamp := m.genesisTime + _slot*config.SlotTimeSec
+	msIntoSlot := uint64(time.Now().UTC().UnixMilli()) - slotStartTimestamp*1000
+	log.WithFields(logrus.Fields{
+		"genesisTime": m.genesisTime,
+		"slotTimeSec": config.SlotTimeSec,
+		"msIntoSlot":  msIntoSlot,
+	}).Infof("sendInclusionList request start - %d milliseconds into slot %d", msIntoSlot, _slot)
+
+	// Add request headers
+	headers := map[string]string{
+		HeaderKeySlotUID:      slotUID.String(),
+		HeaderStartTimeUnixMS: fmt.Sprintf("%d", time.Now().UTC().UnixMilli()),
+	}
+	// Prepare relay responses
+	relayRespCh := make(chan error, len(m.relays))
+
+	// Call the relays
+	for _, relay := range m.relays {
+		go func(relay types.RelayEntry) {
+			path := fmt.Sprintf("/eth/v1/builder/send_inclusion_list/%s/%s/%s", slot, parentHashHex, pubkey)
+			url := relay.GetURI(path)
+			log := log.WithField("url", url)
+			_, err := SendHTTPRequest(context.Background(), m.httpClientSendInclusionList, http.MethodPost, url, ua, headers, inclusionList, nil)
+			relayRespCh <- err
+			if err != nil {
+				log.WithError(err).Warn("error calling sendInclusionList on relay")
+				return
+			}
+		}(relay)
+	}
+	for i := 0; i < len(m.relays); i++ {
+		respErr := <-relayRespCh
+		if respErr == nil {
+			m.respondOK(w, nilResponse)
+			return
+		}
+	}
+	m.respondError(w, http.StatusBadGateway, errNoSuccessfulRelayResponse.Error())
 }

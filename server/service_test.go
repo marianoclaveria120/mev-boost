@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/flashbots/mev-boost/server/types/pocTypes"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -148,18 +149,19 @@ func blindedBlockContentsToPayloadDeneb(signedBlindedBlockContents *eth2ApiV1Den
 func TestNewBoostServiceErrors(t *testing.T) {
 	t.Run("errors when no relays", func(t *testing.T) {
 		_, err := NewBoostService(BoostServiceOpts{
-			Log:                      mock.TestLog,
-			ListenAddr:               ":123",
-			Relays:                   []types.RelayEntry{},
-			RelayMonitors:            []*url.URL{},
-			GenesisForkVersionHex:    "0x00000000",
-			GenesisTime:              0,
-			RelayCheck:               true,
-			RelayMinBid:              types.IntToU256(0),
-			RequestTimeoutGetHeader:  time.Second,
-			RequestTimeoutGetPayload: time.Second,
-			RequestTimeoutRegVal:     time.Second,
-			RequestMaxRetries:        1,
+			Log:                             mock.TestLog,
+			ListenAddr:                      ":123",
+			Relays:                          []types.RelayEntry{},
+			RelayMonitors:                   []*url.URL{},
+			GenesisForkVersionHex:           "0x00000000",
+			GenesisTime:                     0,
+			RelayCheck:                      true,
+			RelayMinBid:                     types.IntToU256(0),
+			RequestTimeoutGetHeader:         time.Second,
+			RequestTimeoutGetPayload:        time.Second,
+			RequestTimeoutRegVal:            time.Second,
+			RequestTimeoutSendInclusionList: time.Second,
+			RequestMaxRetries:               1,
 		})
 		require.Error(t, err)
 	})
@@ -903,4 +905,92 @@ func TestGetPayloadToAllRelays(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	require.Equal(t, 1, backend.relays[0].GetRequestCount(getPayloadPath))
 	require.Equal(t, 1, backend.relays[1].GetRequestCount(getPayloadPath))
+}
+
+func TestSendInclusionList(t *testing.T) {
+	hash := mock.HexToHash("0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7")
+	pubkey := mock.HexToPubkey(
+		"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249")
+	path := fmt.Sprintf("/eth/v1/builder/send_inclusion_list/%d/%s/%s", 1, hash.String(), pubkey.String())
+	require.Equal(t, "/eth/v1/builder/send_inclusion_list/1/0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7/0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249", path)
+
+	payload := &pocTypes.InclusionList{
+		Transactions: []bellatrix.Transaction{mock.HexToBytes("0xf875821054851010b87200830186a094f9aec40f2a2b2effe691491d7cfe3c90ddf6bbd8872386f26fc10000841998aeef8328d3b9a0ac092d4e961e6382b8b3a80e60b4d55a52157ebda53a9183326f4dc3f1d1302ea062e966f7c072a22699fff9eaffe4893fa41d1fb72cd9382fc43fb083d299d8a7")},
+	}
+
+	t.Run("Normal function", func(t *testing.T) {
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, path, payload)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Relay error response", func(t *testing.T) {
+		backend := newTestBackend(t, 2, time.Second)
+
+		backend.relays[0].ResponseDelay = 5 * time.Millisecond
+		backend.relays[1].ResponseDelay = 5 * time.Millisecond
+
+		rr := backend.request(t, http.MethodPost, path, payload)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
+		require.Equal(t, 1, backend.relays[1].GetRequestCount(path))
+
+		// Now make one relay return an error
+		backend.relays[0].OverrideHandleSendInclusionList(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+		})
+		rr = backend.request(t, http.MethodPost, path, payload)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, 2, backend.relays[0].GetRequestCount(path))
+		require.Equal(t, 2, backend.relays[1].GetRequestCount(path))
+
+		// Now make both relays return an error - which should cause the request to fail
+		backend.relays[1].OverrideHandleSendInclusionList(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+		})
+		rr = backend.request(t, http.MethodPost, path, payload)
+		require.Equal(t, http.StatusBadGateway, rr.Code)
+		require.Equal(t, 3, backend.relays[0].GetRequestCount(path))
+		require.Equal(t, 3, backend.relays[1].GetRequestCount(path))
+	})
+
+	t.Run("Invalid inclusion list", func(t *testing.T) {
+		payload := &pocTypes.InclusionList{
+			Transactions: []bellatrix.Transaction{},
+		}
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, path, payload)
+		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Invalid slot number", func(t *testing.T) {
+		// Number larger than uint64 creates parsing error
+		slot := fmt.Sprintf("%d0", uint64(math.MaxUint64))
+		invalidSlotPath := fmt.Sprintf("/eth/v1/builder/send_inclusion_list/%s/%s/%s", slot, hash.String(), pubkey.String())
+
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, invalidSlotPath, payload)
+		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Invalid pubkey length", func(t *testing.T) {
+		invalidPubkeyPath := fmt.Sprintf("/eth/v1/builder/send_inclusion_list/%d/%s/%s", 1, hash.String(), "0x1")
+
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, invalidPubkeyPath, payload)
+		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
+
+	t.Run("Invalid hash length", func(t *testing.T) {
+		invalidSlotPath := fmt.Sprintf("/eth/v1/builder/send_inclusion_list/%d/%s/%s", 1, "0x1", pubkey.String())
+
+		backend := newTestBackend(t, 1, time.Second)
+		rr := backend.request(t, http.MethodPost, invalidSlotPath, payload)
+		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
+	})
 }
