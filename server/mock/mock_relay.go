@@ -3,6 +3,7 @@ package mock
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/flashbots/mev-boost/server/types/pocTypes"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -59,6 +60,7 @@ type Relay struct {
 	handlerOverrideRegisterValidator func(w http.ResponseWriter, req *http.Request)
 	handlerOverrideGetHeader         func(w http.ResponseWriter, req *http.Request)
 	handlerOverrideGetPayload        func(w http.ResponseWriter, req *http.Request)
+	handlerOverrideSendInclusionList func(w http.ResponseWriter, req *http.Request)
 
 	// Default responses placeholders, used if overrider does not exist
 	GetHeaderResponse  *builderSpec.VersionedSignedBuilderBid
@@ -118,6 +120,7 @@ func (m *Relay) getRouter() http.Handler {
 	r.HandleFunc(params.PathRegisterValidator, m.handleRegisterValidator).Methods(http.MethodPost)
 	r.HandleFunc(params.PathGetHeader, m.handleGetHeader).Methods(http.MethodGet)
 	r.HandleFunc(params.PathGetPayload, m.handleGetPayload).Methods(http.MethodPost)
+	r.HandleFunc(params.PathSendInclusionList, m.handleSendInclusionList).Methods(http.MethodPost)
 
 	return m.newTestMiddleware(r)
 }
@@ -325,4 +328,33 @@ func (m *Relay) OverrideHandleGetPayload(method func(w http.ResponseWriter, req 
 	defer m.mu.Unlock()
 
 	m.handlerOverrideGetPayload = method
+}
+func (m *Relay) defaultHandleSendInclusionList(w http.ResponseWriter, req *http.Request) {
+	payload := new(pocTypes.InclusionList)
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+}
+
+func (m *Relay) handleSendInclusionList(w http.ResponseWriter, req *http.Request) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handlerOverrideSendInclusionList != nil {
+		m.handlerOverrideSendInclusionList(w, req)
+		return
+	}
+	m.defaultHandleSendInclusionList(w, req)
+}
+
+func (m *Relay) OverrideHandleSendInclusionList(method func(w http.ResponseWriter, req *http.Request)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.handlerOverrideSendInclusionList = method
 }
